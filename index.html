@@ -1,53 +1,52 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Мониторинг активных фьючерсов</title>
+    <title>Real-Time Futures Monitor</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        .exchange { margin-bottom: 30px; border: 1px solid #ddd; padding: 20px; }
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f6fa; }
+        .exchange { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { padding: 12px; border-bottom: 1px solid #ddd; text-align: left; }
-        th { background-color: #f8f9fa; }
-        .status { padding: 5px 10px; border-radius: 4px; }
-        .connected { background: #27ae60; color: white; }
-        .disconnected { background: #e74c3c; color: white; }
-        .highlight { background-color: #e8f5e9; }
+        th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; }
+        th { background: #3498db; color: white; position: sticky; top: 0; }
+        .status { padding: 8px 12px; border-radius: 20px; font-size: 0.9em; }
+        .connected { background: #2ecc71; }
+        .connecting { background: #f1c40f; }
+        .disconnected { background: #e74c3c; }
+        .highlight { animation: pulse 1s ease-out; }
+        @keyframes pulse { 0% { background: #e8f5e9; } 100% { background: white; } }
     </style>
 </head>
 <body>
     <div class="exchange">
-        <h2>Binance Futures <span class="status disconnected" id="binanceStatus">Отключено</span></h2>
-        <table id="binanceTable">
+        <h2>Binance Futures <span class="status connecting" id="status">Connecting...</span></h2>
+        <table>
             <thead>
                 <tr>
-                    <th>Символ</th>
-                    <th>Сделок (15m)</th>
-                    <th>Цена</th>
-                    <th>Объем</th>
+                    <th>Symbol</th>
+                    <th>Trades (15m)</th>
+                    <th>Price</th>
+                    <th>Volume</th>
                 </tr>
             </thead>
-            <tbody id="binanceData"></tbody>
+            <tbody id="data"></tbody>
         </table>
     </div>
 
 <script>
-const MIN_TRADES = 100000; // 100k сделок
-const WINDOW_SIZE = 15 * 60 * 1000; // 15 минут
-const MAX_SYMBOLS = 50;
-
-class FuturesMonitor {
+class RealTimeMonitor {
     constructor() {
         this.symbols = new Map();
         this.ws = null;
-        this.statusElement = document.getElementById('binanceStatus');
+        this.statusElement = document.getElementById('status');
+        this.updateInterval = null;
+        this.reconnectTimeout = null;
         this.reconnectAttempts = 0;
-        this.lastUpdate = Date.now();
     }
 
     async init() {
         await this.loadSymbols();
         this.connectWebSocket();
-        this.startMaintenance();
+        this.startUIUpdates();
     }
 
     async loadSymbols() {
@@ -59,19 +58,18 @@ class FuturesMonitor {
                 .filter(s => s.status === 'TRADING' 
                     && s.contractType === 'PERPETUAL'
                     && s.symbol.endsWith('USDT'))
-                .slice(0, MAX_SYMBOLS)
                 .forEach(s => {
                     this.symbols.set(s.symbol, {
                         trades: [],
                         price: 0,
                         volume: 0,
-                        lastTradeTime: 0
+                        lastUpdate: Date.now()
                     });
                 });
-            
-            console.log('Loaded symbols:', [...this.symbols.keys()]);
+
+            console.log('Tracking symbols:', [...this.symbols.keys()]);
         } catch(error) {
-            console.error('Error loading symbols:', error);
+            console.error('Failed to load symbols:', error);
         }
     }
 
@@ -81,15 +79,15 @@ class FuturesMonitor {
         this.ws = new WebSocket('wss://fstream.binance.com/ws');
         
         this.ws.onopen = () => {
-            this.reconnectAttempts = 0;
             this.statusElement.className = 'status connected';
             this.statusElement.textContent = 'Connected';
             this.subscribeToSymbols();
+            this.reconnectAttempts = 0;
         };
 
-        this.ws.onmessage = e => this.processTrade(e.data);
+        this.ws.onmessage = e => this.processMessage(JSON.parse(e.data));
         this.ws.onerror = e => this.handleError(e);
-        this.ws.onclose = e => this.handleDisconnect(e);
+        this.ws.onclose = e => this.scheduleReconnect();
     }
 
     subscribeToSymbols() {
@@ -103,81 +101,87 @@ class FuturesMonitor {
         }));
     }
 
-    processTrade(data) {
-        try {
-            const { e: type, s: symbol, p: price, q: quantity, T: timestamp } = JSON.parse(data);
-            
-            if(type !== 'aggTrade') return;
-            
-            const normalizedSymbol = symbol.toUpperCase();
-            if(!this.symbols.has(normalizedSymbol)) return;
+    processMessage(data) {
+        if(data.e !== 'aggTrade') return;
+        
+        const symbol = data.s.toUpperCase();
+        if(!this.symbols.has(symbol)) return;
 
-            const entry = this.symbols.get(normalizedSymbol);
-            entry.trades.push({
-                timestamp,
-                price: parseFloat(price),
-                quantity: parseFloat(quantity)
-            });
-            
-            entry.price = parseFloat(price);
-            entry.volume += parseFloat(quantity);
-            entry.lastTradeTime = Date.now();
-            
-        } catch(error) {
-            console.error('Trade processing error:', error);
-        }
+        const entry = this.symbols.get(symbol);
+        const timestamp = data.T;
+        
+        // Обновление данных
+        entry.trades.push(timestamp);
+        entry.price = parseFloat(data.p);
+        entry.volume += parseFloat(data.q);
+        entry.lastUpdate = Date.now();
     }
 
-    startMaintenance() {
-        // Очистка старых сделок
-        setInterval(() => {
+    startUIUpdates() {
+        this.updateInterval = setInterval(() => {
             const now = Date.now();
-            this.symbols.forEach(entry => {
-                entry.trades = entry.trades.filter(t => now - t.timestamp < WINDOW_SIZE);
-            });
-            this.updateTable();
-        }, 1000);
+            
+            // Фильтрация и сортировка
+            const activeSymbols = [...this.symbols.entries()]
+                .map(([symbol, data]) => ({
+                    symbol,
+                    count: data.trades.filter(t => now - t < 900000).length, // 15 минут
+                    price: data.price,
+                    volume: data.volume,
+                    updated: data.lastUpdate
+                }))
+                .filter(item => item.count > 0)
+                .sort((a, b) => b.count - a.count);
 
-        // Проверка соединения
-        setInterval(() => {
-            if(this.ws.readyState !== WebSocket.OPEN) {
-                this.reconnect();
-            }
-        }, 5000);
+            // Обновление таблицы
+            this.updateTable(activeSymbols);
+        }, 1000); // Обновление каждую секунду
     }
 
-    updateTable() {
-        const activeSymbols = [...this.symbols.entries()]
-            .filter(([_, data]) => data.trades.length >= MIN_TRADES)
-            .sort((a, b) => b[1].trades.length - a[1].trades.length);
+    updateTable(data) {
+        const tbody = document.getElementById('data');
+        const fragment = document.createDocumentFragment();
+        const now = Date.now();
 
-        const tbody = document.getElementById('binanceData');
-        tbody.innerHTML = activeSymbols.map(([symbol, data]) => `
-            <tr class="${Date.now() - data.lastTradeTime < 10000 ? 'highlight' : ''}">
-                <td>${symbol}</td>
-                <td>${data.trades.length.toLocaleString()}</td>
-                <td>${data.price.toFixed(4)}</td>
-                <td>${data.volume.toFixed(0)}</td>
-            </tr>
-        `).join('');
+        data.forEach(item => {
+            const row = document.createElement('tr');
+            if(now - item.updated < 2000) row.classList.add('highlight');
+            
+            row.innerHTML = `
+                <td>${item.symbol}</td>
+                <td>${item.count.toLocaleString()}</td>
+                <td>${item.price.toFixed(4)}</td>
+                <td>${item.volume.toFixed(0)}</td>
+            `;
+            
+            fragment.appendChild(row);
+        });
+
+        tbody.innerHTML = '';
+        tbody.appendChild(fragment);
     }
 
-    handleError(event) {
-        console.error('WebSocket error:', event);
+    handleError(error) {
+        console.error('WebSocket Error:', error);
         this.statusElement.className = 'status disconnected';
         this.statusElement.textContent = 'Connection Error';
     }
 
-    handleDisconnect(event) {
-        console.warn(`Disconnected: ${event.code}`);
-        this.statusElement.className = 'status disconnected';
-        this.statusElement.textContent = 'Reconnecting...';
-        setTimeout(() => this.connectWebSocket(), Math.min(1000 * 2 ** this.reconnectAttempts, 30000));
+    scheduleReconnect() {
+        if(this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
+        
+        const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30000);
         this.reconnectAttempts++;
+        
+        this.statusElement.className = 'status connecting';
+        this.statusElement.textContent = `Reconnecting in ${Math.ceil(delay/1000)}s...`;
+        
+        this.reconnectTimeout = setTimeout(() => this.connectWebSocket(), delay);
     }
 }
 
-const monitor = new FuturesMonitor();
+// Инициализация при загрузке
+const monitor = new RealTimeMonitor();
 window.addEventListener('load', () => monitor.init());
 </script>
 </body>
