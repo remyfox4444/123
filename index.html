@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Мониторинг фьючерсов (исправленный)</title>
+    <title>Мониторинг активных фьючерсов</title>
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; }
         .exchange { margin-bottom: 30px; border: 1px solid #ddd; padding: 20px; }
@@ -11,6 +11,7 @@
         .status { padding: 5px 10px; border-radius: 4px; }
         .connected { background: #27ae60; color: white; }
         .disconnected { background: #e74c3c; color: white; }
+        .highlight { background-color: #e8f5e9; }
     </style>
 </head>
 <body>
@@ -22,6 +23,7 @@
                     <th>Символ</th>
                     <th>Сделок (15m)</th>
                     <th>Цена</th>
+                    <th>Объем</th>
                 </tr>
             </thead>
             <tbody id="binanceData"></tbody>
@@ -29,45 +31,47 @@
     </div>
 
 <script>
-const MIN_TRADES = 1000; // Временно уменьшено для тестирования
-const WINDOW_SIZE = 15 * 60 * 1000;
-const MAX_SYMBOLS = 20;
+const MIN_TRADES = 100000; // 100k сделок
+const WINDOW_SIZE = 15 * 60 * 1000; // 15 минут
+const MAX_SYMBOLS = 50;
 
-class BinanceFuturesMonitor {
+class FuturesMonitor {
     constructor() {
         this.symbols = new Map();
         this.ws = null;
         this.statusElement = document.getElementById('binanceStatus');
         this.reconnectAttempts = 0;
-        this.pingInterval = null;
+        this.lastUpdate = Date.now();
     }
 
     async init() {
-        await this.loadActiveSymbols();
+        await this.loadSymbols();
         this.connectWebSocket();
-        this.startMaintenanceTasks();
+        this.startMaintenance();
     }
 
-    async loadActiveSymbols() {
+    async loadSymbols() {
         try {
             const response = await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
             const data = await response.json();
             
             data.symbols
-                .filter(s => s.status === 'TRADING' && 
-                            s.contractType === 'PERPETUAL' &&
-                            s.symbol.endsWith('USDT'))
+                .filter(s => s.status === 'TRADING' 
+                    && s.contractType === 'PERPETUAL'
+                    && s.symbol.endsWith('USDT'))
                 .slice(0, MAX_SYMBOLS)
-                .forEach(symbolInfo => {
-                    this.symbols.set(symbolInfo.symbol, {
+                .forEach(s => {
+                    this.symbols.set(s.symbol, {
                         trades: [],
                         price: 0,
-                        lastUpdated: 0
+                        volume: 0,
+                        lastTradeTime: 0
                     });
                 });
-
+            
+            console.log('Loaded symbols:', [...this.symbols.keys()]);
         } catch(error) {
-            console.error('Ошибка загрузки символов:', error);
+            console.error('Error loading symbols:', error);
         }
     }
 
@@ -76,64 +80,60 @@ class BinanceFuturesMonitor {
         
         this.ws = new WebSocket('wss://fstream.binance.com/ws');
         
-        this.ws.onopen = () => this.handleConnect();
-        this.ws.onmessage = (e) => this.processMessage(e.data);
-        this.ws.onerror = (e) => this.handleError(e);
-        this.ws.onclose = (e) => this.handleClose(e);
-    }
+        this.ws.onopen = () => {
+            this.reconnectAttempts = 0;
+            this.statusElement.className = 'status connected';
+            this.statusElement.textContent = 'Connected';
+            this.subscribeToSymbols();
+        };
 
-    handleConnect() {
-        this.reconnectAttempts = 0;
-        this.statusElement.className = 'status connected';
-        this.statusElement.textContent = 'Подключено';
-        this.subscribeToSymbols();
-        this.startPing();
-    }
-
-    startPing() {
-        this.pingInterval = setInterval(() => {
-            if(this.ws.readyState === WebSocket.OPEN) {
-                this.ws.send(JSON.stringify({ method: "PING" }));
-            }
-        }, 30000);
+        this.ws.onmessage = e => this.processTrade(e.data);
+        this.ws.onerror = e => this.handleError(e);
+        this.ws.onclose = e => this.handleDisconnect(e);
     }
 
     subscribeToSymbols() {
-        const streams = Array.from(this.symbols.keys())
+        const streams = [...this.symbols.keys()]
             .map(s => `${s.toLowerCase()}@aggTrade`);
         
-        const subscribeMsg = JSON.stringify({
+        this.ws.send(JSON.stringify({
             method: "SUBSCRIBE",
             params: streams,
             id: Date.now()
-        });
-        
-        this.ws.send(subscribeMsg);
+        }));
     }
 
-    processMessage(rawData) {
+    processTrade(data) {
         try {
-            const data = JSON.parse(rawData);
-            if(data.e === 'aggTrade') {
-                const symbol = data.s.toUpperCase();
-                if(this.symbols.has(symbol)) {
-                    const entry = this.symbols.get(symbol);
-                    entry.trades.push(data.T);
-                    entry.price = parseFloat(data.p);
-                    entry.lastUpdated = Date.now();
-                }
-            }
+            const { e: type, s: symbol, p: price, q: quantity, T: timestamp } = JSON.parse(data);
+            
+            if(type !== 'aggTrade') return;
+            
+            const normalizedSymbol = symbol.toUpperCase();
+            if(!this.symbols.has(normalizedSymbol)) return;
+
+            const entry = this.symbols.get(normalizedSymbol);
+            entry.trades.push({
+                timestamp,
+                price: parseFloat(price),
+                quantity: parseFloat(quantity)
+            });
+            
+            entry.price = parseFloat(price);
+            entry.volume += parseFloat(quantity);
+            entry.lastTradeTime = Date.now();
+            
         } catch(error) {
-            console.error('Ошибка обработки сообщения:', error);
+            console.error('Trade processing error:', error);
         }
     }
 
-    startMaintenanceTasks() {
+    startMaintenance() {
         // Очистка старых сделок
         setInterval(() => {
             const now = Date.now();
             this.symbols.forEach(entry => {
-                entry.trades = entry.trades.filter(t => now - t < WINDOW_SIZE);
+                entry.trades = entry.trades.filter(t => now - t.timestamp < WINDOW_SIZE);
             });
             this.updateTable();
         }, 1000);
@@ -147,16 +147,17 @@ class BinanceFuturesMonitor {
     }
 
     updateTable() {
-        const tbody = document.getElementById('binanceData');
-        const activeSymbols = Array.from(this.symbols.entries())
+        const activeSymbols = [...this.symbols.entries()]
             .filter(([_, data]) => data.trades.length >= MIN_TRADES)
             .sort((a, b) => b[1].trades.length - a[1].trades.length);
-        
+
+        const tbody = document.getElementById('binanceData');
         tbody.innerHTML = activeSymbols.map(([symbol, data]) => `
-            <tr>
+            <tr class="${Date.now() - data.lastTradeTime < 10000 ? 'highlight' : ''}">
                 <td>${symbol}</td>
                 <td>${data.trades.length.toLocaleString()}</td>
                 <td>${data.price.toFixed(4)}</td>
+                <td>${data.volume.toFixed(0)}</td>
             </tr>
         `).join('');
     }
@@ -164,27 +165,19 @@ class BinanceFuturesMonitor {
     handleError(event) {
         console.error('WebSocket error:', event);
         this.statusElement.className = 'status disconnected';
-        this.statusElement.textContent = 'Ошибка соединения';
+        this.statusElement.textContent = 'Connection Error';
     }
 
-    handleClose(event) {
-        console.warn(`Соединение закрыто: ${event.code}`);
-        clearInterval(this.pingInterval);
-        this.reconnect();
-    }
-
-    reconnect() {
-        const baseDelay = Math.min(5000 * (this.reconnectAttempts + 1), 30000);
-        const delay = baseDelay + Math.random() * 5000;
-        
-        this.statusElement.textContent = `Переподключение через ${Math.round(delay/1000)}сек`;
+    handleDisconnect(event) {
+        console.warn(`Disconnected: ${event.code}`);
+        this.statusElement.className = 'status disconnected';
+        this.statusElement.textContent = 'Reconnecting...';
+        setTimeout(() => this.connectWebSocket(), Math.min(1000 * 2 ** this.reconnectAttempts, 30000));
         this.reconnectAttempts++;
-        
-        setTimeout(() => this.connectWebSocket(), delay);
     }
 }
 
-const monitor = new BinanceFuturesMonitor();
+const monitor = new FuturesMonitor();
 window.addEventListener('load', () => monitor.init());
 </script>
 </body>
