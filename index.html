@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Активные фьючерсы</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .exchange { margin-bottom: 30px; border: 1px solid #ddd; padding: 20px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 12px; border-bottom: 1px solid #ddd; text-align: left; }
+        th { background-color: #f8f9fa; }
+        .status { padding: 5px 10px; border-radius: 4px; }
+        .connected { background: #27ae60; color: white; }
+        .disconnected { background: #e74c3c; color: white; }
+        .highlight { background-color: #e6ffe6; }
+    </style>
+</head>
+<body>
+    <div class="exchange">
+        <h2>Binance Futures <span class="status" id="binanceStatus"></span></h2>
+        <table id="binanceTable">
+            <thead>
+                <tr>
+                    <th>Символ</th>
+                    <th>Сделок (15m)</th>
+                    <th>Последняя цена</th>
+                </tr>
+            </thead>
+            <tbody id="binanceData"></tbody>
+        </table>
+    </div>
+
+    <div class="exchange">
+        <h2>Bybit Futures <span class="status" id="bybitStatus"></span></h2>
+        <table id="bybitTable">
+            <thead>
+                <tr>
+                    <th>Символ</th>
+                    <th>Сделок (15m)</th>
+                    <th>Последняя цена</th>
+                </tr>
+            </thead>
+            <tbody id="bybitData"></tbody>
+        </table>
+    </div>
+
+<script>
+const MIN_TRADES = 100000;
+const WINDOW_SIZE = 15 * 60 * 1000; // 15 минут
+
+class FuturesMonitor {
+    constructor(exchange) {
+        this.exchange = exchange;
+        this.symbols = new Map();
+        this.ws = null;
+        this.statusElement = document.getElementById(`${exchange}Status`);
+    }
+
+    async init() {
+        await this.loadSymbols();
+        this.connectWebSocket();
+        this.startCleanupInterval();
+    }
+
+    async loadSymbols() {
+        try {
+            const apiUrl = this.exchange === 'binance' 
+                ? 'https://fapi.binance.com/fapi/v1/exchangeInfo' 
+                : 'https://api.bybit.com/v5/market/instruments-info?category=linear';
+            
+            const response = await fetch(apiUrl);
+            const data = await response.json();
+            
+            const activeSymbols = this.exchange === 'binance' 
+                ? data.symbols.filter(s => s.status === 'TRADING' && s.contractType === 'PERPETUAL')
+                : data.result.list.filter(s => s.status === 'Trading');
+            
+            activeSymbols.forEach(symbolInfo => {
+                const symbol = this.exchange === 'binance' ? symbolInfo.symbol : symbolInfo.symbol;
+                this.symbols.set(symbol, {
+                    trades: [],
+                    price: 0
+                });
+            });
+        } catch(error) {
+            console.error(`${this.exchange} error:`, error);
+        }
+    }
+
+    connectWebSocket() {
+        const wsUrl = this.exchange === 'binance' 
+            ? 'wss://fstream.binance.com/ws'
+            : 'wss://stream.bybit.com/v5/public/linear';
+        
+        this.ws = new WebSocket(wsUrl);
+        
+        this.ws.onopen = () => {
+            this.statusElement.className = 'status connected';
+            this.statusElement.textContent = 'Подключено';
+            this.subscribeToTrades();
+        };
+
+        this.ws.onmessage = (event) => this.processTrade(JSON.parse(event.data));
+        this.ws.onerror = (error) => this.handleError(error);
+        this.ws.onclose = () => this.handleDisconnect();
+    }
+
+    subscribeToTrades() {
+        const streams = Array.from(this.symbols.keys()).map(symbol => 
+            this.exchange === 'binance' 
+                ? `${symbol.toLowerCase()}@aggTrade` 
+                : `publicTrade.${symbol}`);
+        
+        const subscribeMsg = this.exchange === 'binance' 
+            ? JSON.stringify({ method: "SUBSCRIBE", params: streams, id: 1 })
+            : JSON.stringify({ op: "subscribe", args: streams });
+        
+        this.ws.send(subscribeMsg);
+    }
+
+    processTrade(data) {
+        try {
+            let symbol, price, timestamp;
+            
+            if (this.exchange === 'binance' && data.e === 'aggTrade') {
+                symbol = data.s.toUpperCase();
+                price = parseFloat(data.p);
+                timestamp = data.T;
+            } else if (this.exchange === 'bybit' && data.topic?.startsWith('publicTrade')) {
+                symbol = data.data[0].s;
+                price = parseFloat(data.data[0].p);
+                timestamp = data.data[0].T;
+            } else return;
+
+            if (this.symbols.has(symbol)) {
+                const entry = this.symbols.get(symbol);
+                entry.trades.push(timestamp);
+                entry.price = price;
+            }
+        } catch(error) {
+            console.error('Ошибка обработки сделки:', error);
+        }
+    }
+
+    startCleanupInterval() {
+        setInterval(() => {
+            const now = Date.now();
+            this.symbols.forEach((entry, symbol) => {
+                entry.trades = entry.trades.filter(t => now - t < WINDOW_SIZE);
+            });
+            this.updateTable();
+        }, 1000);
+    }
+
+    updateTable() {
+        const tbody = document.getElementById(`${this.exchange}Data`);
+        const activeSymbols = Array.from(this.symbols.entries())
+            .filter(([_, data]) => data.trades.length >= MIN_TRADES)
+            .sort((a, b) => b[1].trades.length - a[1].trades.length);
+        
+        const fragment = document.createDocumentFragment();
+        
+        activeSymbols.forEach(([symbol, data]) => {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td>${symbol}</td>
+                <td>${data.trades.length.toLocaleString()}</td>
+                <td>${data.price.toFixed(4)}</td>
+            `;
+            fragment.appendChild(row);
+        });
+
+        tbody.innerHTML = '';
+        tbody.appendChild(fragment);
+    }
+
+    handleError(error) {
+        console.error(`${this.exchange} error:`, error);
+        this.statusElement.className = 'status disconnected';
+        this.statusElement.textContent = 'Ошибка';
+    }
+
+    handleDisconnect() {
+        this.statusElement.className = 'status disconnected';
+        this.statusElement.textContent = 'Переподключение...';
+        setTimeout(() => this.connectWebSocket(), 5000);
+    }
+}
+
+// Инициализация мониторов
+const binanceMonitor = new FuturesMonitor('binance');
+const bybitMonitor = new FuturesMonitor('bybit');
+
+window.addEventListener('load', () => {
+    binanceMonitor.init();
+    bybitMonitor.init();
+});
+</script>
+</body>
+</html>
